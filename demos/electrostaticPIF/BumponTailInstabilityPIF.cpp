@@ -138,7 +138,7 @@ double CDF(const double& x, const double& delta, const double& k, const unsigned
     return cdf;
 }
 
-const char* TestName = "TwoStreamInstabilityPIF";
+const char* TestName = "BumponTailInstabilityPIF";
 
 int main(int argc, char* argv[]) {
     ippl::initialize(argc, argv);
@@ -214,9 +214,10 @@ int main(int argc, char* argv[]) {
 
         Vector_t hr     = {dx, dy, dz};
         Vector_t origin = {rmin[0], rmin[1], rmin[2]};
-
+        const bool isAllPeriodic = true;
         Mesh_t mesh(domain, hr, origin);
-        FieldLayout_t FL(*ippl::Comm, domain, isParallel);
+        // single layout — no upsampling
+        FieldLayout_t FL(*ippl::Comm, domain, isParallel, isAllPeriodic);
         PLayout_t PL(FL, mesh);
 
         double factorConf         = 1.0 / ippl::Comm->size();
@@ -235,11 +236,12 @@ int main(int argc, char* argv[]) {
 
         // Q = -\int\int f dx dv
         double Q = -rmax[0] * rmax[1] * rmax[2];
-        P        = std::make_unique<bunch_type>(PL, hr, rmin, rmax, isParallel, Q, Total_particles);
+        P        = std::make_unique<bunch_type>(PL, hr, rmin, rmax, isParallel, Q, Total_particles, false);   // ← useUpsampledInputs=false, no 2x grid
 
         P->nr_m = nr;
 
         P->rho_m.initialize(mesh, FL);
+        P->rhoDFT_m.initialize(mesh, FL); 
         P->Sk_m.initialize(mesh, FL);
 
         ////////////////////////////////////////////////////////////
@@ -313,10 +315,13 @@ int main(int argc, char* argv[]) {
 
         double tol = std::atof(argv[9]);
         P->initNUFFT(FL, tol);
-
+        P->update();  
         P->scatter();
 
         P->gather();
+        // openPMD: open file and write initial snapshot
+        P->openOpenPMD("BumponTailInstabilityPIF.h5");
+        P->dumpOpenPMD(0);                      
 
         IpplTimings::startTimer(dumpDataTimer);
         P->dumpBumponTail();
@@ -343,7 +348,8 @@ int main(int argc, char* argv[]) {
 
             // Apply particle BC
             IpplTimings::startTimer(BCTimer);
-            PL.applyBC(P->R, PL.getRegionLayout().getDomain());
+            P->update();
+            // PL.applyBC(P->R, PL.getRegionLayout().getDomain());
             IpplTimings::stopTimer(BCTimer);
 
             // scatter the charge onto the underlying grid
@@ -358,6 +364,8 @@ int main(int argc, char* argv[]) {
             IpplTimings::stopTimer(PTimer);
 
             P->time_m += dt;
+            P->dumpOpenPMD(it + 1);  
+
             IpplTimings::startTimer(dumpDataTimer);
             P->dumpBumponTail();
             P->dumpEnergy();
@@ -369,6 +377,7 @@ int main(int argc, char* argv[]) {
         IpplTimings::stopTimer(mainTimer);
         IpplTimings::print();
         IpplTimings::print(std::string("timing.dat"));
+        P->closeOpenPMD();
     }
     ippl::finalize();
 
