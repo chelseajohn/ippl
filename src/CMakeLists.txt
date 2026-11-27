@@ -42,10 +42,13 @@ target_compile_options(
   PUBLIC $<$<COMPILE_LANGUAGE:CXX>:
          $<$<CONFIG:Debug>:-O0
          -g>
-         $<$<CONFIG:RelWithDebInfo>:-O3
+         $<$<CONFIG:RelWithDebInfo>:
          -g>
-         $<$<CONFIG:Release>:-O3>
          >)
+# Note: the Release config used to add an explicit -O3 here. CMake's standard
+# CMAKE_CXX_FLAGS_RELEASE already supplies -O3 -DNDEBUG, so the explicit copy
+# was redundant and produced "multiple -O" warnings from Kokkos' nvcc_wrapper
+# on every IPPL-linked TU.
 
 get_target_property(_ippl_type ippl TYPE)
 if(_ippl_type)
@@ -101,9 +104,26 @@ if(IPPL_ENABLE_SOLVERS)
   add_subdirectory(LinearSolvers)
 endif()
 
+if(IPPL_ENABLE_NBODY)
+  add_subdirectory(NBody)
+endif()
+
+message (STATUS "Adding Stream subdirectory")
+add_subdirectory (Stream)
+
+if(IPPL_ENABLE_CATALYST)
+  include(${PROJECT_SOURCE_DIR}/cmake/SetupCatalyst.cmake)
+endif()
+
+
 include(${PROJECT_SOURCE_DIR}/cmake/PlatformOptions.cmake)
 
 target_link_libraries(ippl PUBLIC Kokkos::kokkos MPI::MPI_CXX)
+
+if(IPPL_ENABLE_KOKKOS_KERNELS)
+  target_link_libraries(ippl PUBLIC Kokkos::kokkoskernels)
+  target_compile_definitions(ippl PUBLIC IPPL_ENABLE_KOKKOS_KERNELS ${IPPL_HOST_LAPACK_DEFINITIONS})
+endif()
 
 if(IPPL_ENABLE_FFT)
   target_link_libraries(ippl PUBLIC Heffte::Heffte)
