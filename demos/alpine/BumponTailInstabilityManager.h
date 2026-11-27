@@ -130,7 +130,7 @@ public:
         this->Q_m =
             std::reduce(this->rmax_m.begin(), this->rmax_m.end(), -1., std::multiplies<double>());
         this->origin_m = this->rmin_m;
-        this->dt_m   = std::min(.05, 0.5 * *std::min_element(this->hr_m.begin(), this->hr_m.end()));
+        this->dt_m   = 0.05; //std::min(.05, 0.5 * *std::min_element(this->hr_m.begin(), this->hr_m.end()));
         this->it_m   = 0;
         this->time_m = 0.0;
 
@@ -248,7 +248,7 @@ public:
         rlayout = ippl::detail::RegionLayout<double, Dim, Mesh_t<Dim>>(*FL, *mesh);
 
         size_type totalP = this->totalP_m;
-        int seed         = 42;
+        int seed         = 18;
         Kokkos::Random_XorShift64_Pool<> rand_pool64((size_type)(seed + 100 * ippl::Comm->rank()));
 
         using samplingR_t =

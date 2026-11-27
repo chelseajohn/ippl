@@ -223,7 +223,7 @@ int main(int argc, char* argv[]) {
 
         // create mesh and layout objects for this problem domain
         Vector_t kw  = {0.5, 0.5, 0.5};
-        double alpha = 0.05;
+        double alpha = 0.5;
         Vector_t rmin(0.0);
         Vector_t rmax   = 2 * pi / kw;
         Vector_t length = rmax - rmin;
@@ -278,7 +278,7 @@ int main(int argc, char* argv[]) {
 
 
         P->create(nloc);
-        Kokkos::Random_XorShift64_Pool<> rand_pool64((size_type)(42 + 100 * ippl::Comm->rank()));
+        Kokkos::Random_XorShift64_Pool<> rand_pool64((size_type)(98 + 100 * ippl::Comm->rank()));
         Kokkos::parallel_for(
             nloc, generate_random<Vector_t, Kokkos::Random_XorShift64_Pool<>, Dim>(
                       P->R.getView(), P->P.getView(), rand_pool64, alpha, kw, minU, maxU));

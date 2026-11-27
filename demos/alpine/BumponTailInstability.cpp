@@ -21,7 +21,7 @@
 
 constexpr unsigned Dim = 3;
 using T                = double;
-const char* TestName   = "BumponTailInstability";
+const char* TestName   = "TwoStreamInstability"; //"BumponTailInstability"
 
 #include "Ippl.h"
 
