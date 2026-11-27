@@ -323,6 +323,8 @@ protected:
         header << "step sigma_x sigma_y sigma_z "
                << "emit_x emit_y emit_z "
                << "T_x T_y T_z T_norm\n";
+        this->openOpenPMD("DisorderHeatingBH_" +
+                          std::to_string(this->N()) + ".h5");
     }
 
     void advanceImpl() override {

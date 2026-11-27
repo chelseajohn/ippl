@@ -28,6 +28,38 @@
 #include "NBody/NBodySolver.hpp"
 #include "NBody/NBodyParticleContainer.hpp"
 
+#ifdef IPPL_ENABLE_OPENPMD
+#include <openPMD/openPMD.hpp>
+#endif
+#include <mpi.h>
+#include <vector>
+#include <sstream>
+
+// Free function: copy owned particle slice from device to host std::vector.
+// Uses the same toHost pattern as NBodySolver.cpp.
+// Must be a free function — CUDA forbids device lambdas in protected members.
+namespace ippl::nbody::detail {
+
+template <class T>
+std::vector<double> deviceSliceToHost(const T* devPtr,
+                                      std::size_t start,
+                                      std::size_t end) {
+    const std::size_t n = end - start;
+    std::vector<double> host(n);
+    if (n == 0) return host;
+#if defined(USE_CUDA)
+    std::vector<T> tmp(n);
+    cstone::memcpyD2HAsync(kExec, devPtr + start, n, tmp.data());
+    syncExec();
+    for (std::size_t i = 0; i < n; ++i) host[i] = static_cast<double>(tmp[i]);
+#else
+    for (std::size_t i = 0; i < n; ++i) host[i] = static_cast<double>(devPtr[start + i]);
+#endif
+    return host;
+}
+
+} // namespace ippl::nbody::detail
+
 namespace ippl::nbody {
 
 // RAII wrapper around IpplTimings::startTimer / stopTimer so per-function
@@ -100,8 +132,11 @@ public:
         , Nt_m(Nt)
         , dt_m(dt) {}
 
-    ~NBodyManager() override = default;
-
+    ~NBodyManager() override {
+    #ifdef IPPL_ENABLE_OPENPMD
+        closeOpenPMD();
+    #endif
+    }
     NBodyManager(const NBodyManager&)            = delete;
     NBodyManager& operator=(const NBodyManager&) = delete;
 
@@ -176,12 +211,103 @@ protected:
     virtual void post_initial_solve() {}
     virtual void dumpImpl() {}
 
+
+
+    // ------------------------------------------------------------------
+    // openPMD output: particle positions (x,y,z) + E field (Ex,Ey,Ez)
+    // Call openOpenPMD() once in post_initial_solve() or pre_run().
+    // dumpOpenPMD() is called automatically from dump() if the series
+    // is open — derived classes need no changes.
+    // ------------------------------------------------------------------
+    #ifdef IPPL_ENABLE_OPENPMD
+        std::unique_ptr<openPMD::Series> openpmd_series_m;
+        std::string                      openpmd_species_m = "bunch";
+
+        void openOpenPMD(const std::string& filename,
+                        const std::string& species = "bunch") {
+            openpmd_species_m = species;
+            openpmd_series_m  = std::make_unique<openPMD::Series>(
+                filename,
+                openPMD::Access::CREATE_LINEAR,
+                ippl::Comm->getCommunicator());
+            openpmd_series_m->setParticlesPath("particles");
+        }
+
+        void closeOpenPMD() {
+            if (!openpmd_series_m) return;
+            openpmd_series_m->flush();
+            openpmd_series_m->close();
+            openpmd_series_m.reset();
+        }
+
+        void dumpOpenPMD() {
+            if (!openpmd_series_m) return;
+
+            auto& pc = this->pc();
+            const std::size_t start    = static_cast<std::size_t>(pc.startIndex());
+            const std::size_t end      = static_cast<std::size_t>(pc.endIndex());
+            const std::size_t localNum = end - start;
+            const std::size_t totalNum = static_cast<std::size_t>(N_m);
+
+            // device slice → host (double precision for openPMD)
+            auto Rx = detail::deviceSliceToHost(getRaw<"Rx">(pc), start, end);
+            auto Ry = detail::deviceSliceToHost(getRaw<"Ry">(pc), start, end);
+            auto Rz = detail::deviceSliceToHost(getRaw<"Rz">(pc), start, end);
+            auto Ex = detail::deviceSliceToHost(getRaw<"Ex">(pc), start, end);
+            auto Ey = detail::deviceSliceToHost(getRaw<"Ey">(pc), start, end);
+            auto Ez = detail::deviceSliceToHost(getRaw<"Ez">(pc), start, end);
+            // MPI offset
+            std::size_t offset = 0;
+            MPI_Exscan(&localNum, &offset, 1,
+                    MPI_UNSIGNED_LONG_LONG, MPI_SUM,
+                    ippl::Comm->getCommunicator());
+            if (rank() == 0) offset = 0;
+
+            openPMD::Offset pOff = {offset};
+            openPMD::Extent pExt = {localNum};
+            openPMD::Dataset pDS(openPMD::determineDatatype<double>(), {totalNum});
+
+            auto iteration = openpmd_series_m->snapshots()[it_m];
+            iteration.setTime(static_cast<double>(time_m));
+
+            auto particles = iteration.particles[openpmd_species_m];
+
+            // positionOffset (required by openPMD standard — zeros)
+            static std::vector<double> zeros;
+            if (zeros.size() < localNum) zeros.assign(localNum, 0.0);
+            auto posOff = particles["positionOffset"];
+            posOff["x"].resetDataset(pDS); posOff["x"].storeChunkRaw(zeros.data(), pOff, pExt);
+            posOff["y"].resetDataset(pDS); posOff["y"].storeChunkRaw(zeros.data(), pOff, pExt);
+            posOff["z"].resetDataset(pDS); posOff["z"].storeChunkRaw(zeros.data(), pOff, pExt);
+
+            // position x,y,z — training INPUTS
+            particles["position"]["x"].resetDataset(pDS);
+            particles["position"]["y"].resetDataset(pDS);
+            particles["position"]["z"].resetDataset(pDS);
+            particles["position"]["x"].storeChunkRaw(Rx.data(), pOff, pExt);
+            particles["position"]["y"].storeChunkRaw(Ry.data(), pOff, pExt);
+            particles["position"]["z"].storeChunkRaw(Rz.data(), pOff, pExt);
+
+            // gathered E x,y,z — training OUTPUTS
+            particles["E"]["x"].resetDataset(pDS);
+            particles["E"]["y"].resetDataset(pDS);
+            particles["E"]["z"].resetDataset(pDS);
+            particles["E"]["x"].storeChunkRaw(Ex.data(), pOff, pExt);
+            particles["E"]["y"].storeChunkRaw(Ey.data(), pOff, pExt);
+            particles["E"]["z"].storeChunkRaw(Ez.data(), pOff, pExt);
+
+            iteration.close();
+        }
+    #endif
     // Sealed dump() wraps dumpImpl() in a "dump" timer. Derived classes
     // implement dumpImpl().
     void dump() {
         static IpplTimings::TimerRef t = IpplTimings::getTimer("dump");
         ScopedIpplTimer scope(t);
         dumpImpl();
+        #ifdef IPPL_ENABLE_OPENPMD
+        dumpOpenPMD();
+        #endif
     }
 
     // Common helpers — drive the loop pieces from advance() in derived classes.
@@ -209,6 +335,7 @@ protected:
         prepareSolverInputs(/*collect=*/true);
         solver_m->runSolver();
     }
+
 
     // Accessors ------------------------------------------------------------
     Container&       pc()             { return *pcontainer_m; }

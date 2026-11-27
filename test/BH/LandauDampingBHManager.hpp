@@ -204,6 +204,8 @@ protected:
 
     void post_initial_solve() override {
         openCsvHeader();
+        this->openOpenPMD("LandauDampingBH_" +
+                          std::to_string(this->N()) + ".h5"); 
     }
 
     void advanceImpl() override {
