@@ -306,6 +306,11 @@ int main(int argc, char* argv[]) {
 
         P->gather();
         msg << "After gather " << endl;
+        
+        // openPMD: open file and write initial snapshot
+        P->openOpenPMD("LandauDampingPIF.h5");
+        P->dumpOpenPMD(0);  
+        int dump_counter = 1;                      
 
         IpplTimings::startTimer(dumpDataTimer);
         P->dumpBumponTail();
@@ -353,6 +358,12 @@ int main(int argc, char* argv[]) {
             IpplTimings::stopTimer(PTimer);
 
             P->time_m += dt;
+            // only write real time steps, skip warmup
+            if (it >= 0) {
+                P->dumpOpenPMD(dump_counter);
+                dump_counter++;
+            }
+
             IpplTimings::startTimer(dumpDataTimer);
             P->dumpBumponTail();
             P->dumpEnergy();
@@ -364,6 +375,7 @@ int main(int argc, char* argv[]) {
         IpplTimings::stopTimer(mainTimer);
         IpplTimings::print();
         IpplTimings::print(std::string("timing.dat"));
+        P->closeOpenPMD();
 
         std::string res_file  = useUpsampledInputs ? "LandauDampingPIF" : "LandauDampingPIFPruned";
         res_file += std::to_string(ippl::Comm->size());

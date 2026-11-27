@@ -152,6 +152,8 @@ public:
             IpplTimings::stopTimer(CAinit);
 
         #endif
+        // open the openPMD file (do this once, before the first dump)
+        this->openOpenPMD("PenningTrap_" + this->solver_m + ".h5");
 
         this->dump();
 
@@ -388,6 +390,7 @@ public:
         static IpplTimings::TimerRef dumpDataTimer = IpplTimings::getTimer("dumpData");
         IpplTimings::startTimer(dumpDataTimer);
         dumpData();
+        this->dumpOpenPMD();
         IpplTimings::stopTimer(dumpDataTimer);
     }
 
