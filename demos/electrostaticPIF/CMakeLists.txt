@@ -13,9 +13,13 @@ if(IPPL_ENABLE_FINUFFT)
     endif()
 endif()
 
+if(IPPL_ENABLE_OPENPMD)
+    set(PIF_OPENPMD_LIBS openPMD::openPMD)
+endif()
+
 foreach(_pif_target IN ITEMS LandauDampingPIF BumponTailInstabilityPIF PenningTrapPIF)
     add_executable(${_pif_target} ${_pif_target}.cpp)
-    target_link_libraries(${_pif_target} PRIVATE IPPL::ippl ${PIF_FINUFFT_LIBS})
+    target_link_libraries(${_pif_target} PRIVATE IPPL::ippl ${PIF_FINUFFT_LIBS} ${PIF_OPENPMD_LIBS})
     target_include_directories(${_pif_target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 endforeach()
 

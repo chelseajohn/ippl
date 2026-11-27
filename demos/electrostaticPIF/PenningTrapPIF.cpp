@@ -137,8 +137,29 @@ int main(int argc, char* argv[]) {
     {
         Inform msg(TestName);
         Inform msg2all(TestName, INFORM_ALL_NODES);
+        // Optional 10th positional argument selects the NUFFT pipeline:
+        //   "pruned"     -> only the lowest n_modes per axis are transformed
+        //                   on the original grid (cheaper, slightly less
+        //                   accurate).
+        //   anything else / absent -> upsampled pipeline on a 2x grid
+        //                             (default, matches the original example).
+        const bool useUpsampledInputs =
+            !(argc > 10 && std::string(argv[10]) == "pruned");
+        // Optional 11th positional argument selects the external FINUFFT 
+        // library for performing NUFFTs instead of the native path. But
+        // IPPL needs to be built with FINUFFT for this. 
+        const bool useFinufft = 
+            (argc > 11 && std::string(argv[11]) == "useFinufft");
+
+        if(useFinufft && useUpsampledInputs) {
+            throw IpplException("PenningTrapPIF",
+                                "Set the output type to be pruned with Finufft.");
+
+        }
 
         ippl::Vector<int, Dim> nr = {std::atoi(argv[1]), std::atoi(argv[2]), std::atoi(argv[3])};
+        ippl::Vector<int, Dim> nrOrig;
+
 
         static IpplTimings::TimerRef mainTimer        = IpplTimings::getTimer("mainTimer");
         static IpplTimings::TimerRef particleCreation = IpplTimings::getTimer("particlesCreation");
@@ -168,23 +189,32 @@ int main(int argc, char* argv[]) {
         using bunch_type = ChargedParticlesPIF<PLayout_t>;
 
         std::shared_ptr<bunch_type> P;
-
+        // Upsampled mode runs all transforms on a 2x grid (nr doubled);
+        // pruned mode keeps the original grid. nrOrig is the user-supplied
+        // resolution and is what the particle layout / NUFFT plans get bound
+        // to in either mode, but in upsampled mode the field storage and
+        // FieldLayout use the doubled nr to give the FFT room to upsample.
         ippl::NDIndex<Dim> domain;
+        ippl::NDIndex<Dim> domainOrig;
         for (unsigned i = 0; i < Dim; i++) {
+            nrOrig[i] = nr[i];
+            if (useUpsampledInputs) {
+                nr[i] = 2 * nr[i];
+            }
             domain[i] = ippl::Index(nr[i]);
+            domainOrig[i] = ippl::Index(nrOrig[i]);
         }
-
         std::array<bool, Dim> isParallel;  // Specifies SERIAL, PARALLEL dims
-        isParallel.fill(false);
+        isParallel.fill(true);
 
         // create mesh and layout objects for this problem domain
         Vector_t rmin(0.0);
         Vector_t rmax(25.0);
-        double dx = rmax[0] / nr[0];
-        double dy = rmax[1] / nr[1];
-        double dz = rmax[2] / nr[2];
-
         Vector_t length = rmax - rmin;
+        double dx       = length[0] / nr[0];
+        double dy       = length[1] / nr[1];
+        double dz       = length[2] / nr[2];
+
 
         Vector_t mu, sd;
 
@@ -199,20 +229,31 @@ int main(int argc, char* argv[]) {
         sd[2] = 0.15 * 20.0;  // length[2];
 
         Vector_t hr     = {dx, dy, dz};
+        Vector_t hrOrig = useUpsampledInputs ? Vector_t{2.0 * hr} : hr;
         Vector_t origin = {rmin[0], rmin[1], rmin[2]};
-
+        
+        const bool isAllPeriodic = true;
         Mesh_t mesh(domain, hr, origin);
-        FieldLayout_t FL(*ippl::Comm, domain, isParallel);
-        PLayout_t PL(FL, mesh);
+        Mesh_t meshOrig(domainOrig, hrOrig, origin);
+        
+        FieldLayout_t FL(*ippl::Comm, domain, isParallel, isAllPeriodic);
+        FieldLayout_t FLOrig(*ippl::Comm, domainOrig, isParallel, isAllPeriodic);
+
+        // Particle layout binds to the original (un-upsampled) field layout so
+        // particle positions and the NUFFT plan see the same resolution; the
+        // upsampled FL is only used for the rho/Sk field storage.
+        PLayout_t PL(FLOrig, meshOrig);
 
         double Q    = -1562.5;
         double Bext = 5.0;
         // P = std::make_unique<bunch_type>(PL,hr,rmin,rmax,decomp,Q,Total_particles);
-        P = std::make_shared<bunch_type>(PL, hr, rmin, rmax, isParallel, Q, Total_particles);
-
+        P        = std::make_unique<bunch_type>(PL, hr, rmin, rmax, isParallel, Q,
+                                                Total_particles, 
+                                                useUpsampledInputs, useFinufft);
         P->nr_m = nr;
 
         P->rho_m.initialize(mesh, FL);
+        P->rhoDFT_m.initialize(mesh, FL);
         P->Sk_m.initialize(mesh, FL);
 
         ////////////////////////////////////////////////////////////
@@ -280,11 +321,14 @@ int main(int argc, char* argv[]) {
         IpplTimings::stopTimer(initializeShapeFunctionPIF);
 
         double tol = std::atof(argv[9]);
-        P->initNUFFT(FL, tol);
-
+        P->initNUFFT(FLOrig, tol);
+        P->update();  
         P->scatter();
 
         P->gather();
+        // openPMD: open file and write initial snapshot
+        P->openOpenPMD("PenningTrapPIF.h5");
+        P->dumpOpenPMD(0);      
 
         IpplTimings::startTimer(dumpDataTimer);
         // P->dumpEnergy();
@@ -333,7 +377,8 @@ int main(int argc, char* argv[]) {
 
             // Apply particle BC
             IpplTimings::startTimer(BCTimer);
-            PL.applyBC(P->R, PL.getRegionLayout().getDomain());
+            // PL.applyBC(P->R, PL.getRegionLayout().getDomain());
+            P->update();
             IpplTimings::stopTimer(BCTimer);
 
             // scatter the charge onto the underlying grid
@@ -372,6 +417,7 @@ int main(int argc, char* argv[]) {
             IpplTimings::stopTimer(PTimer);
 
             P->time_m += dt;
+            P->dumpOpenPMD(it + 1);  
             IpplTimings::startTimer(dumpDataTimer);
             // P->dumpEnergy();
             IpplTimings::stopTimer(dumpDataTimer);
@@ -383,6 +429,12 @@ int main(int argc, char* argv[]) {
         IpplTimings::stopTimer(mainTimer);
         IpplTimings::print();
         IpplTimings::print(std::string("timing.dat"));
+        P->closeOpenPMD();
+
+        std::string res_file  = useUpsampledInputs ? "PenningTrapPIF" : "PenningTrapPIFPruned";
+        res_file += std::to_string(ippl::Comm->size());
+        res_file += ".csv";
+        IpplTimings::dumpToCSV(res_file);
     }
     ippl::finalize();
     return 0;

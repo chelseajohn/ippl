@@ -21,6 +21,9 @@
 #include <Kokkos_MathematicalConstants.hpp>
 #include <Kokkos_MathematicalFunctions.hpp>
 
+#include <openPMD/openPMD.hpp>
+#include <sstream>
+
 // dimension of our positions
 constexpr unsigned Dim = 3;
 using Mesh_t = ippl::UniformCartesian<double, Dim>;
@@ -87,6 +90,33 @@ void dumpVTK(Field_t& rho, int nx, int ny, int nz, int iteration, double dx, dou
             }
         }
     }
+}
+
+
+template <typename VectorAttrib>
+void pif_aos_to_soa(const VectorAttrib& attrib,
+                    Kokkos::View<double*, Kokkos::HostSpace>& Fx,
+                    Kokkos::View<double*, Kokkos::HostSpace>& Fy,
+                    Kokkos::View<double*, Kokkos::HostSpace>& Fz,
+                    std::size_t localNum)
+{
+    auto mirror = attrib.getHostMirror();
+    Kokkos::deep_copy(mirror, attrib.getView());
+
+    Fx = Kokkos::View<double*, Kokkos::HostSpace>("Fx", localNum);
+    Fy = Kokkos::View<double*, Kokkos::HostSpace>("Fy", localNum);
+    Fz = Kokkos::View<double*, Kokkos::HostSpace>("Fz", localNum);
+
+    using HostExec = Kokkos::DefaultHostExecutionSpace;
+    Kokkos::parallel_for(
+        "pif_aos_to_soa",
+        Kokkos::RangePolicy<HostExec>(0, localNum),
+        KOKKOS_LAMBDA(const int64_t i) {
+            Fx(i) = mirror(i)[0];
+            Fy(i) = mirror(i)[1];
+            Fz(i) = mirror(i)[2];
+        });
+    Kokkos::fence();
 }
 
 /*!
@@ -629,6 +659,95 @@ public:
         ippl::Comm->barrier();
     }
 
+    // -----------------------------------------------------------------------
+    // openPMD output: particle positions (x,y,z) + gathered E (Ex,Ey,Ez)
+    // Call openOpenPMD() once after initialisation.
+    // Call dumpOpenPMD(it) after every gather() so E is populated.
+    // Call closeOpenPMD() once after the time loop.
+    // -----------------------------------------------------------------------
+    std::unique_ptr<openPMD::Series> openpmd_series_m;
+
+    void openOpenPMD(const std::string& filename,
+                    const std::string& species = "bunch")
+    {
+        openpmd_species_m = species;
+        openpmd_series_m  = std::make_unique<openPMD::Series>(
+            filename,
+            openPMD::Access::CREATE_LINEAR,
+            ippl::Comm->getCommunicator());
+        openpmd_series_m->setMeshesPath("fields");
+        openpmd_series_m->setParticlesPath("particles");
+    }
+
+    void closeOpenPMD()
+    {
+        if (!openpmd_series_m) return;
+        openpmd_series_m->flush();
+        openpmd_series_m->close();
+        openpmd_series_m.reset();
+    }
+
+    void dumpOpenPMD(int it)
+    {
+        if (!openpmd_series_m) return;
+
+        const std::size_t localNum = static_cast<std::size_t>(this->getLocalNum());
+        const std::size_t totalNum = static_cast<std::size_t>(Np_m);
+        const int rank             = ippl::Comm->rank();
+
+        // AoS (device) → SoA (host)
+        using HostView = Kokkos::View<double*, Kokkos::HostSpace>;
+        HostView Rx, Ry, Rz, Ex, Ey, Ez;
+        pif_aos_to_soa(this->R, Rx, Ry, Rz, localNum);
+        pif_aos_to_soa(this->E, Ex, Ey, Ez, localNum);
+
+        // MPI offset
+        std::size_t offset = 0;
+        MPI_Exscan(&localNum, &offset, 1,
+                MPI_UNSIGNED_LONG_LONG, MPI_SUM,
+                ippl::Comm->getCommunicator());
+        if (rank == 0) offset = 0;
+
+        openPMD::Offset pOff = {offset};
+        openPMD::Extent pExt = {localNum};
+        openPMD::Dataset pDS(openPMD::determineDatatype<double>(), {totalNum});
+
+        auto iteration = openpmd_series_m->snapshots()[it];
+        iteration.setTime(time_m);
+
+        auto particles = iteration.particles[openpmd_species_m];
+
+        static std::vector<double> zeros;
+        if (zeros.size() < localNum) zeros.assign(localNum, 0.0);
+
+        auto posOff = particles["positionOffset"];
+        posOff["x"].resetDataset(pDS);
+        posOff["y"].resetDataset(pDS);
+        posOff["z"].resetDataset(pDS);
+        posOff["x"].storeChunkRaw(zeros.data(), pOff, pExt);
+        posOff["y"].storeChunkRaw(zeros.data(), pOff, pExt);
+        posOff["z"].storeChunkRaw(zeros.data(), pOff, pExt);
+        // position x,y,z — training INPUTS
+        particles["position"]["x"].resetDataset(pDS);
+        particles["position"]["y"].resetDataset(pDS);
+        particles["position"]["z"].resetDataset(pDS);
+        particles["position"]["x"].storeChunkRaw(Rx.data(), pOff, pExt);
+        particles["position"]["y"].storeChunkRaw(Ry.data(), pOff, pExt);
+        particles["position"]["z"].storeChunkRaw(Rz.data(), pOff, pExt);
+
+        // gathered E x,y,z — training OUTPUTS
+        particles["E"]["x"].resetDataset(pDS);
+        particles["E"]["y"].resetDataset(pDS);
+        particles["E"]["z"].resetDataset(pDS);
+        particles["E"]["x"].storeChunkRaw(Ex.data(), pOff, pExt);
+        particles["E"]["y"].storeChunkRaw(Ey.data(), pOff, pExt);
+        particles["E"]["z"].storeChunkRaw(Ez.data(), pOff, pExt);
+
+        iteration.close();
+    }
+
+private:
+    std::string openpmd_species_m = "bunch";
 private:
     void setBCAllPeriodic() { this->setParticleBC(ippl::BC::PERIODIC); }
 };
